@@ -13,7 +13,7 @@ namespace ThreadPool
         public static int UsedThreads = 0;
 
         private static ConcurrentQueue<WaitCallback> queue = new ConcurrentQueue<WaitCallback>();
-        private static List<Thread> workers = new List<Thread>(MaxThreads);
+        private static List<Thread> threads = new List<Thread>(MaxThreads);
 
 
         private static Thread backgroundThread = new Thread(() =>
@@ -58,100 +58,103 @@ namespace ThreadPool
         }
 
 
+        /// <summary>
+        /// Enqueue a thread if there is a task to do and remove stopped thread if it exists.
+        /// Newly added thread will run only if there is free place for it.
+        /// </summary>
         private static void DequeueRun()
         {
-            WaitCallback wcb = null;
+            WaitCallback task = null;
             Thread stoppedThread = null;
 
-            lock (workers)
+            lock (threads)
             {
                 if (FinishedThreads > 0)
                 { 
-                    //there may be threads need to be renewed / removed
-                    foreach (var worker in workers)
+                    // there may be threads need to be renewed / removed
+                    foreach (var thread in threads)
                     {
-                        if (worker.ThreadState == ThreadState.Stopped)
+                        if (thread.ThreadState == ThreadState.Stopped)
                         {
-                            //get a reference to the stopped thread
-                            stoppedThread = worker; 
+                            // get a reference to the stopped thread
+                            stoppedThread = thread; 
                             break;
                         }
                     }
                 }
 
-                //reassign the maximum threads used
-                if (workers.Count > UsedThreads) 
+                // reassign the used threads count
+                if (threads.Count > UsedThreads) 
                 {
-                    UsedThreads = workers.Count;
+                    UsedThreads = threads.Count;
                 }
+
                 lock (queue)
                 {
-                    if (queue.Count > 0 && MaxThreads - workers.Count > 0)
+                    if (queue.Count > 0 && MaxThreads - threads.Count > 0)
                     {
-                        //if there's still work, dequeue something
-                        queue.TryDequeue(out wcb); 
+                        // if there's still work, dequeue something
+                        queue.TryDequeue(out task); 
                     }
                 }
             }
             
-            //dequeued nothing and there exist a stopped thread
-            if (wcb == null && stoppedThread != null) 
-            {
-                bool empty = false;
 
-                //find out if the queue is empty
-                lock (queue) 
+            // there isn't a task to do, but there is a stopped thread
+            if (task == null && stoppedThread != null) 
+            {
+                // remove the stopped thread from the list
+                lock (threads)
                 {
-                    empty = queue.Count == 0;
-                }
-                if (empty)
-                {
-                    lock (workers)
+                    if (!threads.Remove(stoppedThread))
                     {
-                        if (!workers.Remove(stoppedThread))
-                        {
-                            throw new SystemException("Could not remove a thread from the list!");
-                        }
-                        else
-                        {
-                            Interlocked.Decrement(ref FinishedThreads);
-                        }
+                        throw new SystemException("Could not remove a thread from the list!");
+                    }
+                    else
+                    {
+                        Interlocked.Decrement(ref FinishedThreads);
                     }
                 }
             }
-            else if (wcb != null)
-            {
-                Thread thread = new Thread(new ParameterizedThreadStart(ThreadFunc));
 
-                // thread will not keep an application running after all foreground threads have exited
-                thread.IsBackground = true;
-                lock (workers)
+            // there is a task to do
+            else if (task != null)
+            {
+                Thread newThread = new Thread(new ParameterizedThreadStart(ThreadFunc));
+
+                // thread will not keep an application running after all foreground threads have exited.
+                newThread.IsBackground = true;
+
+                lock (threads)
                 {
-                    if (MaxThreads - workers.Count > 0)
+                    if (MaxThreads - threads.Count > 0)
                     {
-                        //replace the stopped thread with a new one
+                        // replace the stopped thread with a new one
                         if (stoppedThread != null) 
                         {
-                            workers[workers.IndexOf(stoppedThread)] = thread;
+                            threads[threads.IndexOf(stoppedThread)] = newThread;
                         }
+                        // add a new thread to the list
                         else
                         {
-                            workers.Add(thread);
+                            threads.Add(newThread);
                         }
                     }
                     else
                     {
-                        // let other active threads do the work.
+                        // enqueue the task and let other active threads do the work.
                         lock (queue) 
                         {
-                            queue.Enqueue(wcb);
-                            wcb = null;
+                            queue.Enqueue(task);
+                            task = null;
                         }
                     }
                 }
-                if (wcb != null)
+
+                // let newly added task do its work 
+                if (task != null)
                 {
-                    thread.Start(wcb);
+                    newThread.Start(task);
                 }
             }
         }
@@ -159,34 +162,34 @@ namespace ThreadPool
 
         public static void ThreadFunc(Object obj)
         {
-            //when a thread is started, it already has a job assigned to it.
-            WaitCallback wcb = obj as WaitCallback;
-            if (wcb == null)
+            //when a thread is started, it already has a task assigned to it.
+            WaitCallback task = obj as WaitCallback;
+            if (task == null)
             {
                 throw new ArgumentException("ThreadFunc must recieve WaitCallback as a parameter!");
             }
-            wcb.Invoke(null);
+            task.Invoke(null);
 
-            //from now on, I'm dequeueing/invoking jobs from the queue.
+            //from now on, I'm dequeueing/invoking tasks from the queue.
             while (true) 
             {
-                wcb = null;
+                task = null;
 
-                lock (workers)
+                lock (threads)
                 {
                     lock (queue)
                     {
                         //help a non-empty queue to get rid of its load
                         if (queue.Count > 0) 
                         {
-                            queue.TryDequeue(out wcb);
+                            queue.TryDequeue(out task);
                         }
                     }
                 }
 
-                if (wcb != null)
+                if (task != null)
                 {
-                    wcb.Invoke(null);
+                    task.Invoke(null);
                 }
                 else
                 {
